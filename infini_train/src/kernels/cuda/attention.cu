@@ -199,8 +199,6 @@ inline std::shared_ptr<Tensor> CastTensorTo(const std::shared_ptr<Tensor> &tenso
 
 inline bool CanUseFusedPath(const std::shared_ptr<Tensor> &query, const std::shared_ptr<Tensor> &key,
                             const std::shared_ptr<Tensor> &value, const std::shared_ptr<Tensor> &attn_mask) {
-    // Current fused kernel is only enabled for GQA-like layouts to avoid
-    // regressions observed on standard MHA shapes.
     if (attn_mask) {
         return false;
     }
@@ -213,10 +211,71 @@ inline bool CanUseFusedPath(const std::shared_ptr<Tensor> &query, const std::sha
     if (query->Dims().size() != 4 || key->Dims().size() != 4 || value->Dims().size() != 4) {
         return false;
     }
-    if (query->Dims()[1] == key->Dims()[1]) {
+    if (query->Dims()[1] < key->Dims()[1]) {
+        return false;
+    }
+    if (query->Dims()[1] % key->Dims()[1] != 0) {
         return false;
     }
     if (query->Dims()[3] > 256 || value->Dims()[3] > 256) {
+        return false;
+    }
+    return true;
+}
+
+inline std::string GetFusedPathRejectionReason(const std::shared_ptr<Tensor> &query, const std::shared_ptr<Tensor> &key,
+                                               const std::shared_ptr<Tensor> &value,
+                                               const std::shared_ptr<Tensor> &attn_mask) {
+    if (attn_mask) {
+        return "attn_mask is not nullptr";
+    }
+    if (!IsFlashSupportedDtype(query) || !IsFlashSupportedDtype(key) || !IsFlashSupportedDtype(value)) {
+        return "dtype is not FLOAT32/BFLOAT16";
+    }
+    if (query->Dtype() != key->Dtype() || query->Dtype() != value->Dtype()) {
+        return "q/k/v dtype mismatch";
+    }
+    if (query->Dims().size() != 4 || key->Dims().size() != 4 || value->Dims().size() != 4) {
+        return "q/k/v rank is not 4";
+    }
+    if (query->Dims()[1] < key->Dims()[1]) {
+        return "q_heads < kv_heads";
+    }
+    if (query->Dims()[1] % key->Dims()[1] != 0) {
+        return "q_heads % kv_heads != 0";
+    }
+    if (query->Dims()[3] > 256 || value->Dims()[3] > 256) {
+        return "head_dim/value_dim > 256";
+    }
+    return "unknown";
+}
+
+inline bool CanUseFusedBackwardPath(const std::shared_ptr<Tensor> &query, const std::shared_ptr<Tensor> &key,
+                                    const std::shared_ptr<Tensor> &value, const std::shared_ptr<Tensor> &attn_mask,
+                                    const std::shared_ptr<Tensor> &lse,
+                                    const std::shared_ptr<Tensor> &grad_output) {
+    if (!CanUseFusedPath(query, key, value, attn_mask)) {
+        return false;
+    }
+    if (!lse || !grad_output) {
+        return false;
+    }
+    if (lse->Dtype() != DataType::kFLOAT32) {
+        return false;
+    }
+    if (grad_output->Dtype() != query->Dtype()) {
+        return false;
+    }
+    if (lse->Dims().size() != 3) {
+        return false;
+    }
+    if (grad_output->Dims().size() != 4) {
+        return false;
+    }
+    if (lse->Dims()[0] != query->Dims()[0] || lse->Dims()[1] != query->Dims()[1] || lse->Dims()[2] != query->Dims()[2]) {
+        return false;
+    }
+    if (grad_output->Dims() != std::vector<int64_t>{query->Dims()[0], query->Dims()[1], query->Dims()[2], value->Dims()[3]}) {
         return false;
     }
     return true;
@@ -754,8 +813,19 @@ FlashAttentionForward(const std::shared_ptr<Tensor> &query, const std::shared_pt
     CHECK_EQ(query->Dims()[3], key->Dims()[3]);
 
     if (!CanUseFusedPath(query, key, value, attn_mask)) {
+        LOG_FIRST_N(ERROR, 1) << "FlashAttentionForward fallback path selected. reason="
+                              << GetFusedPathRejectionReason(query, key, value, attn_mask)
+                              << " q_heads=" << query->Dims()[1] << " kv_heads=" << key->Dims()[1]
+                              << " q_len=" << query->Dims()[2] << " kv_len=" << key->Dims()[2]
+                              << " head_dim=" << query->Dims()[3] << " value_dim=" << value->Dims()[3]
+                              << " has_attn_mask=" << (attn_mask != nullptr) << " enable_gqa=" << enable_gqa;
         return RunFallbackForward(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa);
     }
+    LOG_FIRST_N(ERROR, 1) << "FlashAttentionForward fused path selected."
+                          << " q_heads=" << query->Dims()[1] << " kv_heads=" << key->Dims()[1]
+                          << " q_len=" << query->Dims()[2] << " kv_len=" << key->Dims()[2]
+                          << " head_dim=" << query->Dims()[3] << " value_dim=" << value->Dims()[3]
+                          << " enable_gqa=" << enable_gqa;
 
     const int64_t batch = query->Dims()[0];
     const int64_t query_heads = query->Dims()[1];
@@ -867,14 +937,24 @@ FlashAttentionBackward(const std::shared_ptr<Tensor> &query, const std::shared_p
     CHECK_LT(dropout_p, 1.0);
     CHECK_GT(scale, 0.0);
 
-    // Use the refactored fallback backward for all shapes. This avoids the
-    // atomicAdd-heavy fused backward hotspot and keeps memory usage predictable.
-    (void)lse;
-    (void)rng_seed;
-    (void)rng_offset;
-    if (true) {
+    auto grad_output_kernel = grad_output;
+    if (grad_output->Dtype() != query->Dtype()) {
+        grad_output_kernel = CastTensorTo(grad_output, query->Dtype());
+    }
+
+    if (!CanUseFusedBackwardPath(query, key, value, attn_mask, lse, grad_output_kernel)) {
+        LOG_FIRST_N(ERROR, 1) << "FlashAttentionBackward fallback path selected."
+                              << " q_heads=" << query->Dims()[1] << " kv_heads=" << key->Dims()[1]
+                              << " q_len=" << query->Dims()[2] << " kv_len=" << key->Dims()[2]
+                              << " head_dim=" << query->Dims()[3] << " value_dim=" << value->Dims()[3]
+                              << " has_attn_mask=" << (attn_mask != nullptr) << " enable_gqa=" << enable_gqa;
         return RunFallbackBackward(query, key, value, attn_mask, grad_output, dropout_p, is_causal, scale, enable_gqa);
     }
+    LOG_FIRST_N(ERROR, 1) << "FlashAttentionBackward fused path selected."
+                          << " q_heads=" << query->Dims()[1] << " kv_heads=" << key->Dims()[1]
+                          << " q_len=" << query->Dims()[2] << " kv_len=" << key->Dims()[2]
+                          << " head_dim=" << query->Dims()[3] << " value_dim=" << value->Dims()[3]
+                          << " enable_gqa=" << enable_gqa;
 
     const int64_t batch = query->Dims()[0];
     const int64_t query_heads = query->Dims()[1];
@@ -907,24 +987,24 @@ FlashAttentionBackward(const std::shared_ptr<Tensor> &query, const std::shared_p
         if (use_dropout) {
             if (use_bf16) {
                 LaunchFusedBackwardKernel<kFusedBlockSizeSmall, true, __nv_bfloat16>(
-                    query, key, value, grad_output, lse, grad_query, grad_key, grad_value, batch, query_heads,
+                    query, key, value, grad_output_kernel, lse, grad_query, grad_key, grad_value, batch, query_heads,
                     key_heads, q_len, kv_len, head_dim, value_dim, group_size, is_causal, static_cast<float>(scale),
                     static_cast<float>(dropout_p), rng_seed, rng_offset, cuda_stream);
             } else {
                 LaunchFusedBackwardKernel<kFusedBlockSizeSmall, true, float>(
-                    query, key, value, grad_output, lse, grad_query, grad_key, grad_value, batch, query_heads,
+                    query, key, value, grad_output_kernel, lse, grad_query, grad_key, grad_value, batch, query_heads,
                     key_heads, q_len, kv_len, head_dim, value_dim, group_size, is_causal, static_cast<float>(scale),
                     static_cast<float>(dropout_p), rng_seed, rng_offset, cuda_stream);
             }
         } else {
             if (use_bf16) {
                 LaunchFusedBackwardKernel<kFusedBlockSizeSmall, false, __nv_bfloat16>(
-                    query, key, value, grad_output, lse, grad_query, grad_key, grad_value, batch, query_heads,
+                    query, key, value, grad_output_kernel, lse, grad_query, grad_key, grad_value, batch, query_heads,
                     key_heads, q_len, kv_len, head_dim, value_dim, group_size, is_causal, static_cast<float>(scale),
                     static_cast<float>(dropout_p), rng_seed, rng_offset, cuda_stream);
             } else {
                 LaunchFusedBackwardKernel<kFusedBlockSizeSmall, false, float>(
-                    query, key, value, grad_output, lse, grad_query, grad_key, grad_value, batch, query_heads,
+                    query, key, value, grad_output_kernel, lse, grad_query, grad_key, grad_value, batch, query_heads,
                     key_heads, q_len, kv_len, head_dim, value_dim, group_size, is_causal, static_cast<float>(scale),
                     static_cast<float>(dropout_p), rng_seed, rng_offset, cuda_stream);
             }
@@ -933,24 +1013,24 @@ FlashAttentionBackward(const std::shared_ptr<Tensor> &query, const std::shared_p
         if (use_dropout) {
             if (use_bf16) {
                 LaunchFusedBackwardKernel<kFusedBlockSizeLarge, true, __nv_bfloat16>(
-                    query, key, value, grad_output, lse, grad_query, grad_key, grad_value, batch, query_heads,
+                    query, key, value, grad_output_kernel, lse, grad_query, grad_key, grad_value, batch, query_heads,
                     key_heads, q_len, kv_len, head_dim, value_dim, group_size, is_causal, static_cast<float>(scale),
                     static_cast<float>(dropout_p), rng_seed, rng_offset, cuda_stream);
             } else {
                 LaunchFusedBackwardKernel<kFusedBlockSizeLarge, true, float>(
-                    query, key, value, grad_output, lse, grad_query, grad_key, grad_value, batch, query_heads,
+                    query, key, value, grad_output_kernel, lse, grad_query, grad_key, grad_value, batch, query_heads,
                     key_heads, q_len, kv_len, head_dim, value_dim, group_size, is_causal, static_cast<float>(scale),
                     static_cast<float>(dropout_p), rng_seed, rng_offset, cuda_stream);
             }
         } else {
             if (use_bf16) {
                 LaunchFusedBackwardKernel<kFusedBlockSizeLarge, false, __nv_bfloat16>(
-                    query, key, value, grad_output, lse, grad_query, grad_key, grad_value, batch, query_heads,
+                    query, key, value, grad_output_kernel, lse, grad_query, grad_key, grad_value, batch, query_heads,
                     key_heads, q_len, kv_len, head_dim, value_dim, group_size, is_causal, static_cast<float>(scale),
                     static_cast<float>(dropout_p), rng_seed, rng_offset, cuda_stream);
             } else {
                 LaunchFusedBackwardKernel<kFusedBlockSizeLarge, false, float>(
-                    query, key, value, grad_output, lse, grad_query, grad_key, grad_value, batch, query_heads,
+                    query, key, value, grad_output_kernel, lse, grad_query, grad_key, grad_value, batch, query_heads,
                     key_heads, q_len, kv_len, head_dim, value_dim, group_size, is_causal, static_cast<float>(scale),
                     static_cast<float>(dropout_p), rng_seed, rng_offset, cuda_stream);
             }

@@ -108,8 +108,9 @@ CausalSelfAttention::Forward(const std::vector<std::shared_ptr<infini_train::Ten
     std::shared_ptr<infini_train::Tensor> y;
 
     const bool is_flash_dtype = q->Dtype() == DataType::kFLOAT32 || q->Dtype() == DataType::kBFLOAT16;
-    const bool can_use_flash_kernel = config_.use_flash_attention && q->GetDevice().IsCUDA() && is_flash_dtype
-                                   && k->Dtype() == q->Dtype() && v->Dtype() == q->Dtype();
+    const bool short_mha_shape = (T <= 128 && head_dim <= 64);
+    const bool can_use_flash_kernel = config_.use_flash_attention && !short_mha_shape && q->GetDevice().IsCUDA()
+                                   && is_flash_dtype && k->Dtype() == q->Dtype() && v->Dtype() == q->Dtype();
 
     if (can_use_flash_kernel) {
         y = nn::function::ScaledDotProductAttention(q, k, v, nullptr, 0.0, true);

@@ -213,22 +213,37 @@ std::vector<std::shared_ptr<Tensor>> CausalSelfAttention::Forward(const std::vec
     // TODO(zbl): support flash attention later
     std::shared_ptr<Tensor> y;
 
-    const bool is_flash_dtype = q->Dtype() == DataType::kFLOAT32 || q->Dtype() == DataType::kBFLOAT16;
-    const bool can_use_flash_kernel = config_.use_flash_attention && q->GetDevice().IsCUDA() && is_flash_dtype
-                                   && k->Dtype() == q->Dtype() && v->Dtype() == q->Dtype();
+    auto q_flash_candidate = q;
+    auto k_flash_candidate = k;
+    auto v_flash_candidate = v;
+    if (config_.use_flash_attention && q->GetDevice().IsCUDA()) {
+        const DataType target_dtype = v->Dtype();
+        if (q_flash_candidate->Dtype() != target_dtype) {
+            q_flash_candidate = std::make_shared<Tensor>(q_flash_candidate->To(target_dtype));
+        }
+        if (k_flash_candidate->Dtype() != target_dtype) {
+            k_flash_candidate = std::make_shared<Tensor>(k_flash_candidate->To(target_dtype));
+        }
+    }
+
+    const bool is_flash_dtype
+        = q_flash_candidate->Dtype() == DataType::kFLOAT32 || q_flash_candidate->Dtype() == DataType::kBFLOAT16;
+    const bool can_use_flash_kernel = config_.use_flash_attention && q_flash_candidate->GetDevice().IsCUDA()
+                                   && is_flash_dtype && k_flash_candidate->Dtype() == q_flash_candidate->Dtype()
+                                   && v_flash_candidate->Dtype() == q_flash_candidate->Dtype();
 
     if (can_use_flash_kernel) {
         // Flash path keeps native GQA shape (k/v on KV_local heads) to avoid RepeatKV expansion.
-        auto k_flash = k->Transpose(1, 2);
-        auto v_flash = v->Transpose(1, 2);
+        auto k_flash = k_flash_candidate->Transpose(1, 2);
+        auto v_flash = v_flash_candidate->Transpose(1, 2);
 
         // Training mask in this model is standard causal Triu; prefer causal fast-path with null attn_mask.
         const bool use_causal_fast_path = (mask != nullptr && start_pos == nullptr);
         const auto &attn_mask = use_causal_fast_path ? nullptr : mask;
         const bool is_causal = (mask == nullptr) || use_causal_fast_path;
 
-        y = nn::function::ScaledDotProductAttention(q, k_flash, v_flash, attn_mask, 0.0, is_causal, std::nullopt,
-                                                    n_rep_ > 1);
+        y = nn::function::ScaledDotProductAttention(q_flash_candidate, k_flash, v_flash, attn_mask, 0.0, is_causal,
+                                                    std::nullopt, n_rep_ > 1);
     } else {
         // align n_head in GQA
         // (B, T, KV_local, D) -> (B, T, H_local, D) via RepeatKV
