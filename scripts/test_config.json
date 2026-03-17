@@ -42,7 +42,7 @@
                     "args": {
                         "dtype": "float32",
                         "num_iteration": 10,
-                        "batch_size": 80,
+                        "batch_size": 40,
                         "total_batch_size": 5120
                     }
                 },
@@ -51,7 +51,7 @@
                     "args": {
                         "dtype": "bfloat16",
                         "num_iteration": 10,
-                        "batch_size": 80,
+                        "batch_size": 40,
                         "total_batch_size": 5120
                     }
                 },
@@ -330,7 +330,7 @@
                     "args": {
                         "dtype": "float32",
                         "num_iteration": 10,
-                        "batch_size": 80,
+                        "batch_size": 40,
                         "total_batch_size": 5120,
                         "lora_rank": 8,
                         "lora_alpha": 16.0,
@@ -342,7 +342,7 @@
                     "args": {
                         "dtype": "bfloat16",
                         "num_iteration": 10,
-                        "batch_size": 80,
+                        "batch_size": 40,
                         "total_batch_size": 5120,
                         "lora_rank": 8,
                         "lora_alpha": 16.0,
